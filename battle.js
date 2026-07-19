@@ -2,7 +2,10 @@
 // (server.js); if no server responds we fall back to a local solo sim vs AI
 // using the exact same sim.js module.
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createSim, TYPES, FIELD_W, FIELD_D, SPACING } from './sim.js';
+import { createArena } from './physics/arena_api.js';
+import { CONFIG } from './physics/config.js';
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -11,7 +14,17 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a2028);
 scene.fog = new THREE.Fog(0x1a2028, 180, 380);
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 1, 600);
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// Prefer the discrete (NVIDIA) GPU, but fall back gracefully if the driver rejects
+// that context attribute or WebGL2 is blocked (hardware accel off).
+function makeRenderer() {
+  for (const attrs of [{ antialias: true, powerPreference: 'high-performance' }, { antialias: true }, {}]) {
+    try { return new THREE.WebGLRenderer(attrs); } catch (e) { console.warn('WebGL attempt failed:', attrs, e.message); }
+  }
+  document.body.innerHTML = '<div style="color:#eee;font-family:system-ui;padding:24px;line-height:1.6">' +
+    '<h2>WebGL2 unavailable</h2>Enable hardware acceleration in your browser and check <b>chrome://gpu</b>.</div>';
+  throw new Error('WebGL2 context could not be created');
+}
+const renderer = makeRenderer();
 renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 document.body.appendChild(renderer.domElement);
@@ -100,6 +113,26 @@ function decodeSnapshot(buf) {
     });
     o += 7;
   }
+  // props (fort bricks + ragdoll corpses) — full 3D transforms, rendered from the
+  // latest snapshot without interpolation (they move fast when hit).
+  const nP = v.getUint16(o, true); o += 2;
+  const props = new Float32Array(nP * 11); // x,y,z, qx,qy,qz,qw, hx,hy,hz, kind
+  for (let i = 0; i < nP; i++) {
+    const p = i * 11;
+    props[p] = v.getInt16(o, true) / 100;
+    props[p + 1] = v.getInt16(o + 2, true) / 100;
+    props[p + 2] = v.getInt16(o + 4, true) / 100;
+    props[p + 3] = v.getInt16(o + 6, true) / 32767;
+    props[p + 4] = v.getInt16(o + 8, true) / 32767;
+    props[p + 5] = v.getInt16(o + 10, true) / 32767;
+    props[p + 6] = v.getInt16(o + 12, true) / 32767;
+    props[p + 7] = v.getUint8(o + 14) / 50;
+    props[p + 8] = v.getUint8(o + 15) / 50;
+    props[p + 9] = v.getUint8(o + 16) / 50;
+    props[p + 10] = v.getUint8(o + 17);
+    o += 18;
+  }
+  s.props = props; s.nProps = nP;
   snaps.push(s);
   if (snaps.length > 12) snaps.shift();
 }
@@ -124,6 +157,7 @@ function setupNetReaders() {
     out.fighting = !!(f & 4);
     out.broken = !!(f & 8);
     out.stance = !!(f & 16);
+    out.down = !!(f & 32);
     if (out.state === 1 && !dieTime.has(i)) dieTime.set(i, performance.now());
     out.deathT = out.state === 1 ? (performance.now() - (dieTime.get(i) ?? performance.now())) / 1000 : 0;
     return true;
@@ -145,6 +179,7 @@ function setupSoloReaders() {
     out.x = s.x; out.z = s.z; out.face = s.face;
     out.state = s.state; out.fighting = s.fightT > 0;
     out.broken = s.unit.broken; out.stance = !!s.unit.stance;
+    out.down = s.down > 0;
     out.deathT = s.deathT;
     return true;
   };
@@ -154,12 +189,16 @@ function setupSoloReaders() {
   };
 }
 
-function startSolo() {
+let booting = false;
+async function startSolo() {
+  if (booting || mode) return; // async WASM load leaves `mode` null; guard re-entry
+  booting = true;
+  const arena = await createArena({ maxBodies: CONFIG.maxBodies }); // browser-side box3d world for solo play
   mode = 'solo';
   you = { team: 0, slot: -1 }; // -1 = owns all of team 0
-  sim = createSim({ seed: (Math.random() * 1e9) | 0, players: [2, 2] });
+  sim = createSim({ seed: (Math.random() * 1e9) | 0, players: [2, 2], arena, fort: location.hash.includes('fort'), dom: location.hash.includes('dom') });
   for (let p = 0; p < 2; p++) sim.ai.delete(`0:${p}`);
-  buildMeta(sim.units.map((u) => ({ id: u.id, team: u.team, slot: u.slot, type: u.typeKey, n: u.type.n })));
+  buildMeta(sim.units.map((u) => ({ id: u.id, team: u.team, slot: u.slot, type: u.typeKey, n: u.n0 })));
   setupSoloReaders();
   showLobby([
     { team: 0, slot: 0, human: true }, { team: 0, slot: 1, human: true },
@@ -181,6 +220,7 @@ function connect() {
         clearTimeout(fallback);
         mode = 'net';
         you = m.you;
+        if (m.render) renderer.setPixelRatio(Math.min(devicePixelRatio, m.render.pixelRatio || 2));
         buildMeta(m.units);
         setupNetReaders();
         phase = m.state;
@@ -194,6 +234,8 @@ function connect() {
       } else if (m.type === 'ev') {
         for (const ev of m.e) handleEvent(ev);
         statsData = m.stats; countsData = m.counts || countsData;
+        if (m.zones) zonesData = m.zones;
+        if (m.tickets) ticketsData = m.tickets;
         if (m.winner !== null && m.winner !== undefined) winner = m.winner;
       }
     } else if (mode === 'net') decodeSnapshot(e.data);
@@ -207,71 +249,73 @@ function sendCmd(cmd) {
 }
 
 // ---------------- rendering pools (built after init) ----------------
-let soldierMesh = null;
 const dummy = new THREE.Object3D();
 dummy.rotation.order = 'YXZ';
 const catMeshes = new Map(); // unit idx -> group
 const colorKey = [];
 
-// horses (cavalry mounts + riders) and spears/pikes — shared geo/materials, rebuilt per battle
-let riderMesh = null, weaponMesh = null;
-const riderIdx = [], weaponIdx = []; // soldier i -> instance slot or -1
+// Living soldiers are little articulated humanoids built from instanced capsule
+// parts (torso, head, 2 arms, 2 legs) with procedural walk/attack — GPU-instanced
+// so the whole army stays cheap. Same capsule look as the death ragdoll.
+let hTorso = null, hHead = null, hArm = null, hLeg = null;
+const walkPhase = [];      // per soldier gait phase
+const soPrev = [];         // per soldier {x,z} for speed estimation
+const gTorso = new THREE.CapsuleGeometry(0.16, 0.30, 3, 8);
+const gHead = new THREE.SphereGeometry(0.145, 10, 8);
+const gLeg = new THREE.CapsuleGeometry(0.085, 0.34, 3, 6); gLeg.translate(0, -0.255, 0); // pivot at hip
+const gArm = new THREE.CapsuleGeometry(0.065, 0.32, 3, 6); gArm.translate(0, -0.225, 0); // pivot at shoulder
+// matrix scratch for composing root * part transforms
+const _root = new THREE.Matrix4(), _part = new THREE.Matrix4();
+const _qY = new THREE.Quaternion(), _qX = new THREE.Quaternion();
+const _pos = new THREE.Vector3(), _pos2 = new THREE.Vector3(), _one = new THREE.Vector3(1, 1, 1);
+const _YA = new THREE.Vector3(0, 1, 0), _XA = new THREE.Vector3(1, 0, 0);
+
+// spears/pikes in infantry hands
+let weaponMesh = null;
+const weaponIdx = []; // soldier i -> instance slot or -1
 const weaponLower = []; // soldier i -> seconds left holding the weapon leveled
-const riderGeo = new THREE.CapsuleGeometry(0.28, 0.6, 3, 8);
 const weaponGeo = new THREE.BoxGeometry(0.07, 0.07, 1);
 weaponGeo.translate(0, 0, 0.5); // extend forward from the hand
-const riderMat = new THREE.MeshStandardMaterial({ roughness: 0.7 });
 const weaponMat = new THREE.MeshStandardMaterial({ color: 0x8a6b3d, roughness: 0.9 });
 
 function buildRenderers() {
-  if (soldierMesh) {
-    scene.remove(soldierMesh);
-    soldierMesh.geometry.dispose();
-    soldierMesh.material.dispose();
-    soldierMesh.dispose();
-  }
+  for (const m of [hTorso, hHead, hArm, hLeg, weaponMesh]) if (m) { scene.remove(m); m.dispose(); }
   for (const m of catMeshes.values()) scene.remove(m);
   catMeshes.clear();
 
   soldierUnitIdx.length = 0;
   meta.units.forEach((u, j) => { for (let i = 0; i < u.n; i++) soldierUnitIdx[u.start + i] = j; });
 
-  soldierMesh = new THREE.InstancedMesh(
-    new THREE.CapsuleGeometry(0.35, 0.9, 3, 8),
-    new THREE.MeshStandardMaterial({ roughness: 0.7 }),
-    meta.nS
-  );
-  soldierMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  scene.add(soldierMesh);
-  for (let i = 0; i < meta.nS; i++) {
-    soldierMesh.setColorAt(i, TEAM_COLORS[meta.units[soldierUnitIdx[i]].team]);
-    colorKey[i] = -1;
+  // pick one leader soldier per team (centre of that team's first melee unit)
+  leaderIndex[0] = leaderIndex[1] = -1;
+  for (const u of meta.units) {
+    if (leaderIndex[u.team] < 0 && u.type !== 'catapult') leaderIndex[u.team] = u.start + Math.floor(u.n / 2);
   }
-  soldierMesh.instanceColor.needsUpdate = true;
+
+  const nS = meta.nS;
+  const mk = (geo, count) => {
+    const m = new THREE.InstancedMesh(geo, new THREE.MeshStandardMaterial({ roughness: 0.75 }), count);
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); m.frustumCulled = false; scene.add(m); return m;
+  };
+  hTorso = mk(gTorso, nS); hHead = mk(gHead, nS); hLeg = mk(gLeg, nS * 2); hArm = mk(gArm, nS * 2);
+  for (let i = 0; i < nS; i++) {
+    const col = TEAM_COLORS[meta.units[soldierUnitIdx[i]].team];
+    hTorso.setColorAt(i, col); hHead.setColorAt(i, col);
+    hLeg.setColorAt(i * 2, col); hLeg.setColorAt(i * 2 + 1, col);
+    hArm.setColorAt(i * 2, col); hArm.setColorAt(i * 2 + 1, col);
+    colorKey[i] = -1; walkPhase[i] = Math.random() * 6.28; soPrev[i] = null;
+  }
+  for (const m of [hTorso, hHead, hLeg, hArm]) m.instanceColor.needsUpdate = true;
 
   meta.units.forEach((u, j) => { if (u.type === 'catapult') catMeshes.set(j, makeCatapultMesh(u.team)); });
 
-  // riders on cavalry mounts, spears/pikes in infantry hands
-  if (riderMesh) { scene.remove(riderMesh); riderMesh.dispose(); }
-  if (weaponMesh) { scene.remove(weaponMesh); weaponMesh.dispose(); }
-  let nR = 0, nW = 0;
-  for (let i = 0; i < meta.nS; i++) {
-    const t = meta.units[soldierUnitIdx[i]].type;
-    riderIdx[i] = t === 'cavalry' ? nR++ : -1;
-    weaponIdx[i] = t === 'spear' || t === 'pike' ? nW++ : -1;
-  }
-  riderMesh = new THREE.InstancedMesh(riderGeo, riderMat, Math.max(1, nR));
+  // spears/pikes in infantry hands
+  let nW = 0;
+  for (let i = 0; i < nS; i++) { const t = meta.units[soldierUnitIdx[i]].type; weaponIdx[i] = (t === 'spear' || t === 'pike') ? nW++ : -1; }
   weaponMesh = new THREE.InstancedMesh(weaponGeo, weaponMat, Math.max(1, nW));
-  for (const m of [riderMesh, weaponMesh]) {
-    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    m.frustumCulled = false;
-    dummy.position.set(0, -10, 0); dummy.rotation.set(0, 0, 0); dummy.scale.setScalar(0); dummy.updateMatrix();
-    for (let i = 0; i < m.count; i++) m.setMatrixAt(i, dummy.matrix);
-    scene.add(m);
-  }
-  for (let i = 0; i < meta.nS; i++)
-    if (riderIdx[i] >= 0) riderMesh.setColorAt(riderIdx[i], TEAM_COLORS[meta.units[soldierUnitIdx[i]].team]);
-  if (riderMesh.instanceColor) riderMesh.instanceColor.needsUpdate = true;
+  weaponMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage); weaponMesh.frustumCulled = false;
+  for (let i = 0; i < weaponMesh.count; i++) weaponMesh.setMatrixAt(i, _zeroM);
+  scene.add(weaponMesh);
 }
 
 function makeCatapultMesh(team) {
@@ -300,6 +344,143 @@ arrowMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 arrowMesh.frustumCulled = false;
 scene.add(arrowMesh);
 const flyingArrows = [];
+
+// ---------------- physics props: fort bricks + ragdoll corpses ----------------
+// One instanced mesh each, driven by full 3D transforms (pos+quat) from the sim
+// (solo: read the arena buffer directly; net: the decoded snapshot props).
+// pools sized to the largest tier so any server tier fits (unused instances hidden)
+const BRICK_CAP = 24000, RAGDOLL_BONE_CAP = 128 * 14 + 16;
+const brickMesh = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshStandardMaterial({ color: 0x9a8f7c, roughness: 1 }),
+  BRICK_CAP
+);
+// jointed ragdoll bones: one capsule instance per bone (cap * 14 bones). Base
+// capsule has radius 1 and cylinder length 2 (y: -1..1); per instance we scale
+// x/z by the bone radius and y by its half-length, and orient by the streamed quat.
+const ragdollMesh = new THREE.InstancedMesh(
+  new THREE.CapsuleGeometry(1, 2, 4, 8),
+  new THREE.MeshStandardMaterial({ color: 0x8a5a3a, roughness: 0.9 }),
+  RAGDOLL_BONE_CAP
+);
+// siege engines (trebuchet frames/arms + battering rams) — wooden boxes
+const woodMesh = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshStandardMaterial({ color: 0x6b4626, roughness: 0.9 }),
+  96
+);
+for (const m of [brickMesh, ragdollMesh, woodMesh]) {
+  m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  m.frustumCulled = false;
+  m.castShadow = false;
+  scene.add(m);
+}
+// ---------------- champion leaders (one animated GLB gladiator per team) ----------------
+// Small CC0 KayKit rigs (~1.6 MB) with embedded Walking_A / Idle / Death_A clips.
+// The rest of each army stays instanced; only the leader is a skinned mesh.
+const LEADER_MODEL = ['./assets/mobs/gladiators/knight.glb', './assets/mobs/gladiators/barbarian.glb'];
+const leaders = [null, null];         // { root, mixer, actions, current, prevX, prevZ }
+const leaderIndex = [-1, -1];         // soldier instance index rendered as the leader
+const leaderState = [null, null];     // {x, z, face, state} filled each frame
+function setLeaderAnim(L, name) {
+  if (L.current === name || !L.actions[name]) return;
+  const to = L.actions[name]; to.reset().setEffectiveWeight(1).play();
+  const from = L.actions[L.current];
+  if (from) from.crossFadeTo(to, 0.25, false);
+  L.current = name;
+}
+(function loadLeaders() {
+  if (CONFIG.heroesPerTeam <= 0) return; // leaders disabled
+  const loader = new GLTFLoader();
+  for (let team = 0; team < 2; team++) {
+    loader.loadAsync(LEADER_MODEL[team]).then((gltf) => {
+      const root = gltf.scene;
+      root.traverse((o) => { if (o.isMesh) { o.frustumCulled = false; o.castShadow = true; } });
+      root.scale.setScalar(1.7);
+      root.visible = false;
+      scene.add(root);
+      const mixer = new THREE.AnimationMixer(root);
+      const act = (n) => { const c = THREE.AnimationClip.findByName(gltf.animations, n); return c ? mixer.clipAction(c) : null; };
+      const actions = { idle: act('Idle'), walk: act('Walking_A'), death: act('Death_A') };
+      if (actions.idle) actions.idle.play();
+      leaders[team] = { root, mixer, actions, current: 'idle', prevX: 0, prevZ: 0 };
+    }).catch((e) => console.warn('leader model failed to load:', LEADER_MODEL[team], e));
+  }
+})();
+
+// ---------------- domination: capture-zone rings + ticket HUD ----------------
+let zonesData = null, ticketsData = null;
+const ZONE_COLORS = [0xd23c3c, 0x3c64d2]; // holder red/blue; gray when unheld
+const zoneRings = [];
+const domEl = document.createElement('div');
+domEl.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);font:bold 20px system-ui;text-shadow:0 2px 5px #000;display:none;color:#ddd;pointer-events:none';
+document.body.appendChild(domEl);
+function updateDom() {
+  const zs = mode === 'solo' ? (sim && sim.zones) : zonesData;
+  const tk = mode === 'solo' ? (sim && sim.tickets) : ticketsData;
+  if (!zs) { domEl.style.display = 'none'; for (const r of zoneRings) r.visible = false; return; }
+  while (zoneRings.length < zs.length) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(zs[zoneRings.length].r - 1, zs[zoneRings.length].r, 48),
+      new THREE.MeshBasicMaterial({ color: 0x999999, transparent: true, opacity: 0.75, side: THREE.DoubleSide })
+    );
+    ring.rotation.x = -Math.PI / 2; ring.position.y = 0.1;
+    scene.add(ring); zoneRings.push(ring);
+  }
+  zs.forEach((z, i) => {
+    const r = zoneRings[i];
+    r.visible = true;
+    r.position.set(z.x, 0.1, z.z);
+    r.material.color.setHex(z.holder === -1 ? 0x999999 : ZONE_COLORS[z.holder]);
+  });
+  if (tk) {
+    domEl.style.display = 'block';
+    domEl.innerHTML = `<span style="color:#e88">⚑ Red ${tk[0]}</span> &nbsp;·&nbsp; <span style="color:#8ae">${tk[1]} Blue ⚑</span>`;
+  }
+}
+
+let lastBricks = 0, lastRags = 0, lastWood = 0;
+function updateProps() {
+  let nb = 0, nr = 0, nw = 0;
+  const put = (kind, x, y, z, qx, qy, qz, qw, hx, hy, hz) => {
+    dummy.position.set(x, y, z);
+    dummy.quaternion.set(qx, qy, qz, qw);
+    if (kind === 5) { // ragdoll bone: capsule, x/z = radius, y = half-length
+      if (nr >= ragdollMesh.count) return;
+      dummy.scale.set(hx, hy, hz);
+      dummy.updateMatrix(); ragdollMesh.setMatrixAt(nr++, dummy.matrix);
+    } else if (kind === 7 || kind === 8) { // siege engine timber (trebuchet frame/arm, ram)
+      if (nw >= woodMesh.count) return;
+      dummy.scale.set(hx * 2, hy * 2, hz * 2);
+      dummy.updateMatrix(); woodMesh.setMatrixAt(nw++, dummy.matrix);
+    } else { // brick (2) or rubble (6)
+      if (nb >= brickMesh.count) return;
+      dummy.scale.set(hx * 2, hy * 2, hz * 2);
+      dummy.updateMatrix(); brickMesh.setMatrixAt(nb++, dummy.matrix);
+    }
+  };
+  if (mode === 'solo' && sim) {
+    const xf = sim.arena.transforms, ST = sim.arena.XF_STRIDE, cnt = sim.arena.count;
+    for (let h = 0; h < cnt; h++) {
+      const b = h * ST, k = xf[b + 7];
+      if (k === 2 || k === 5 || k === 6 || k === 7 || k === 8) put(k, xf[b], xf[b + 1], xf[b + 2], xf[b + 3], xf[b + 4], xf[b + 5], xf[b + 6], xf[b + 8], xf[b + 9], xf[b + 10]);
+    }
+  } else if (mode === 'net') {
+    const s = snaps[snaps.length - 1];
+    if (s && s.props) {
+      const P = s.props;
+      for (let i = 0; i < s.nProps; i++) { const p = i * 11; put(P[p + 10], P[p], P[p + 1], P[p + 2], P[p + 3], P[p + 4], P[p + 5], P[p + 6], P[p + 7], P[p + 8], P[p + 9]); }
+    }
+  }
+  dummy.scale.setScalar(0); dummy.updateMatrix();
+  for (let i = nb; i < lastBricks; i++) brickMesh.setMatrixAt(i, dummy.matrix);
+  for (let i = nr; i < lastRags; i++) ragdollMesh.setMatrixAt(i, dummy.matrix);
+  for (let i = nw; i < lastWood; i++) woodMesh.setMatrixAt(i, dummy.matrix);
+  lastBricks = nb; lastRags = nr; lastWood = nw;
+  brickMesh.instanceMatrix.needsUpdate = true;
+  ragdollMesh.instanceMatrix.needsUpdate = true;
+  woodMesh.instanceMatrix.needsUpdate = true;
+}
 
 const stonePool = [];
 const stoneGeo = new THREE.SphereGeometry(0.45, 8, 8);
@@ -375,6 +556,11 @@ function handleEvent(ev) {
     spawnParticles(a[0], 0.5, a[1], 45, 0xff8833, 9, 0.9);
     spawnParticles(a[0], 0.5, a[1], 30, 0x777777, 5, 1.4);
     spawnParticles(a[0], 0.3, a[1], 20, 0xbbaa88, 7, 0.8);
+  } else if (kind === 'firebomb') { // fire pot: a much bigger fireball + smoke column
+    spawnParticles(a[0], 0.6, a[1], 90, 0xff5511, 16, 1.2);
+    spawnParticles(a[0], 1.0, a[1], 60, 0xffcc33, 12, 0.9);
+    spawnParticles(a[0], 1.5, a[1], 50, 0x333333, 6, 2.2);
+    spawnParticles(a[0], 0.3, a[1], 30, 0xbbaa88, 10, 1.0);
   } else if (kind === 'shot') {
     flyingStones.push({ sx: a[0], sz: a[1], tx: a[2], tz: a[3], dur: a[4], t: 0, mesh: getStone() });
     spawnParticles(a[0], 2, a[1], 8, 0xbbaa88, 3, 0.6);
@@ -498,8 +684,21 @@ addEventListener('pointerup', (e) => {
 
 // ---------------- per-frame instance update ----------------
 const rs = {}; // reusable readSoldier output
+const _zeroM = new THREE.Matrix4().makeScale(0, 0, 0);
+function hideHuman(i) {
+  hTorso.setMatrixAt(i, _zeroM); hHead.setMatrixAt(i, _zeroM);
+  hLeg.setMatrixAt(i * 2, _zeroM); hLeg.setMatrixAt(i * 2 + 1, _zeroM);
+  hArm.setMatrixAt(i * 2, _zeroM); hArm.setMatrixAt(i * 2 + 1, _zeroM);
+}
+// place one body part: world = root * translate(o) * rotX(swing)
+function placePart(mesh, idx, ox, oy, oz, swingX) {
+  _qX.setFromAxisAngle(_XA, swingX);
+  _part.compose(_pos.set(ox, oy, oz), _qX, _one);
+  _part.premultiply(_root);
+  mesh.setMatrixAt(idx, _part);
+}
 function updateInstances(dt) {
-  if (!soldierMesh) return;
+  if (!hTorso) return;
   for (const c of unitCentroids) if (c) { c.x = 0; c.z = 0; c.n = 0; }
   meta.units.forEach((u, j) => { unitCentroids[j] = unitCentroids[j] || {}; unitCentroids[j].x = 0; unitCentroids[j].z = 0; unitCentroids[j].n = 0; });
 
@@ -509,73 +708,88 @@ function updateInstances(dt) {
     const j = soldierUnitIdx[i], u = meta.units[j];
     const isCav = u.type === 'cavalry';
 
-    if (rs.state === 2) { dummy.position.set(0, -10, 0); dummy.scale.setScalar(0); dummy.rotation.set(0, 0, 0); }
-    else if (rs.state === 1) {
-      const t = rs.deathT;
-      dummy.position.set(rs.x, Math.max((isCav ? 0.5 : 0.35) - Math.max(0, t - 2.5) * 0.4, -0.6), rs.z);
-      dummy.rotation.set(Math.PI / 2, rs.face, isCav ? Math.min(t / 0.4, 1) * 1.2 : 0);
-      if (!isCav) dummy.rotation.x = Math.min(t / 0.4, 1) * Math.PI / 2;
-      dummy.scale.set(1, isCav ? 1.4 : 1, 1);
-    } else {
-      const c = unitCentroids[j];
-      c.x += rs.x; c.z += rs.z; c.n++;
-      if (isCav) {
-        dummy.position.set(rs.x, 0.55, rs.z);
-        dummy.rotation.set(Math.PI / 2, rs.face, 0);
-        dummy.scale.set(1.2, 1.4, 1.2);
-      } else {
-        dummy.position.set(rs.x, 0.8, rs.z);
-        dummy.rotation.set(0, rs.face, 0);
-        dummy.scale.set(1, 1, 1);
-      }
-      if (rs.fighting && Math.random() < dt * 1.2) spawnParticles(rs.x, 1.2, rs.z, 2, 0xaa1515, 3, 0.5);
+    const lt = i === leaderIndex[0] ? 0 : i === leaderIndex[1] ? 1 : -1;
+    if (lt >= 0 && leaders[lt]) { // rendered as the animated GLB champion instead
+      leaderState[lt] = { x: rs.x, z: rs.z, face: rs.face, state: rs.state };
+      hideHuman(i);
+      const wl = weaponIdx[i]; if (wl >= 0) weaponMesh.setMatrixAt(wl, _zeroM);
+      continue;
     }
-    dummy.updateMatrix();
-    soldierMesh.setMatrixAt(i, dummy.matrix);
 
-    const ri = riderIdx[i];
-    if (ri >= 0) {
-      if (rs.state !== 0) dummy.scale.setScalar(0);
-      else {
-        dummy.position.set(rs.x, 1.45, rs.z);
-        dummy.rotation.set(0, rs.face, 0);
-        dummy.scale.set(0.9, 0.9, 0.9);
-      }
-      dummy.updateMatrix();
-      riderMesh.setMatrixAt(ri, dummy.matrix);
+    if (rs.state !== 0) { // dead: hide the humanoid; the jointed ragdoll shows the corpse
+      hideHuman(i);
+      const wl = weaponIdx[i]; if (wl >= 0) weaponMesh.setMatrixAt(wl, _zeroM);
+      continue;
     }
+
+    const c = unitCentroids[j];
+    c.x += rs.x; c.z += rs.z; c.n++;
+
+    // gait: advance a walk phase by movement speed; swing legs/arms accordingly
+    const pv = soPrev[i] || (soPrev[i] = { x: rs.x, z: rs.z });
+    const spd = Math.hypot(rs.x - pv.x, rs.z - pv.z) / Math.max(dt, 1e-3);
+    pv.x = rs.x; pv.z = rs.z;
+    const downed = !!rs.down;
+    const amp = downed ? 0 : Math.min(1, spd / 2.5);
+    walkPhase[i] += (3 + spd * 1.5) * dt;
+    const sw = Math.sin(walkPhase[i]) * 0.7 * amp;
+    const bob = Math.abs(Math.sin(walkPhase[i])) * 0.04 * amp;
+    const sc = isCav ? 1.18 : 1.0;
+
+    _qY.setFromAxisAngle(_YA, rs.face);
+    if (downed) { _qX.setFromAxisAngle(_XA, -1.42); _qY.multiply(_qX); } // knocked flat on their back
+    _root.compose(_pos.set(rs.x, 0, rs.z), _qY, _pos2.set(sc, sc, sc)); // downed: rotation lays parts near y≈0.1-0.2
+    placePart(hTorso, i, 0, 0.98 + bob, 0, 0);
+    placePart(hHead, i, 0, 1.42 + bob, 0, 0);
+    placePart(hLeg, i * 2, 0.09, 0.74, 0, downed ? 0.35 : sw);
+    placePart(hLeg, i * 2 + 1, -0.09, 0.74, 0, downed ? 0.2 : -sw);
+    const rArm = downed ? 0.6 : rs.fighting ? -1.3 : sw * 0.8; // splayed when down, strike when fighting
+    placePart(hArm, i * 2, 0.24, 1.2, 0, downed ? 0.5 : -sw * 0.8);
+    placePart(hArm, i * 2 + 1, -0.24, 1.2, 0, rArm);
+    if (rs.fighting && Math.random() < dt * 1.2) spawnParticles(rs.x, 1.2, rs.z, 2, 0xaa1515, 3, 0.5);
+
     const wi = weaponIdx[i];
     if (wi >= 0) {
-      if (rs.state !== 0) dummy.scale.setScalar(0);
-      else {
-        // stay leveled a moment after each swing so pikes don't bob between attacks
-        weaponLower[i] = rs.fighting ? 1.5 : Math.max(0, (weaponLower[i] || 0) - dt);
-        dummy.position.set(rs.x + Math.sin(rs.face) * 0.25, 1.15, rs.z + Math.cos(rs.face) * 0.25);
-        dummy.rotation.set(rs.stance || weaponLower[i] > 0 ? -0.12 : -0.95, rs.face, 0);
-        dummy.scale.set(1, 1, TYPES[u.type].range + 0.8);
-      }
+      weaponLower[i] = rs.fighting ? 1.5 : Math.max(0, (weaponLower[i] || 0) - dt);
+      dummy.position.set(rs.x + Math.sin(rs.face) * 0.25, 1.15, rs.z + Math.cos(rs.face) * 0.25);
+      dummy.rotation.set(rs.stance || weaponLower[i] > 0 ? -0.12 : -0.95, rs.face, 0);
+      dummy.scale.set(1, 1, TYPES[u.type].range + 0.8);
       dummy.updateMatrix();
       weaponMesh.setMatrixAt(wi, dummy.matrix);
     }
 
-    // color only when state changes (death blood burst piggybacks here)
-    const key = rs.state | (rs.broken ? 4 : 0) | (selected.has(j) ? 8 : 0);
+    // recolor parts only when team/broken/selected state changes
+    const key = (rs.broken ? 4 : 0) | (selected.has(j) ? 8 : 0);
     if (colorKey[i] !== key) {
-      if (rs.state === 1 && (colorKey[i] & 3) === 0) spawnParticles(rs.x, 1, rs.z, 6, 0x8f1a1a, 4, 0.8);
       colorKey[i] = key;
       const base = TEAM_COLORS[u.team];
-      soldierMesh.setColorAt(i,
-        rs.state !== 0 ? DEAD_COLOR
-        : rs.broken ? base.clone().lerp(WHITE, 0.65)
-        : selected.has(j) ? base.clone().lerp(WHITE, 0.45)
-        : base);
+      // routed = dimmed team colour (still clearly Red/Blue, just faded); selected = brightened
+      const col = rs.broken ? base.clone().multiplyScalar(0.42) : selected.has(j) ? base.clone().lerp(WHITE, 0.45) : base;
+      hTorso.setColorAt(i, col); hHead.setColorAt(i, col);
+      hLeg.setColorAt(i * 2, col); hLeg.setColorAt(i * 2 + 1, col);
+      hArm.setColorAt(i * 2, col); hArm.setColorAt(i * 2 + 1, col);
       colorDirty = true;
     }
   }
-  if (colorDirty) soldierMesh.instanceColor.needsUpdate = true;
-  soldierMesh.instanceMatrix.needsUpdate = true;
-  riderMesh.instanceMatrix.needsUpdate = true;
+  for (const m of [hTorso, hHead, hLeg, hArm]) { if (colorDirty) m.instanceColor.needsUpdate = true; m.instanceMatrix.needsUpdate = true; }
   weaponMesh.instanceMatrix.needsUpdate = true;
+
+  // place & animate each team's champion at its leader soldier; walk when moving,
+  // idle when still, death when killed (KayKit rigs face -Z, hence face + PI)
+  for (let t = 0; t < 2; t++) {
+    const L = leaders[t], st = leaderState[t];
+    if (!L) continue;
+    if (st && st.state !== 2) {
+      L.root.visible = true;
+      L.root.position.set(st.x, 0, st.z);
+      L.root.rotation.y = st.face + Math.PI;
+      const sp = Math.hypot(st.x - L.prevX, st.z - L.prevZ);
+      L.prevX = st.x; L.prevZ = st.z;
+      setLeaderAnim(L, st.state === 1 ? 'death' : sp > 0.02 ? 'walk' : 'idle');
+    } else L.root.visible = false;
+    L.mixer.update(dt);
+    leaderState[t] = null;
+  }
 
   for (const c of unitCentroids) if (c && c.n) { c.x /= c.n; c.z /= c.n; }
 
@@ -721,6 +935,8 @@ function frame(now) {
   updateCamera(dt);
   if (mode) {
     updateInstances(dt);
+    updateProps();
+    updateDom();
     updateProjectiles(dt);
     updateParticles(dt);
     hudT -= dt;

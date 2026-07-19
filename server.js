@@ -4,26 +4,37 @@
 // Clients send JSON orders; server broadcasts binary snapshots @ 12Hz plus
 // JSON events/stats.
 import { createSim } from './sim.js';
+import { createArena } from './physics/arena_api.js';
+import { CONFIG, setTier } from './physics/config.js';
 
 const arg = (name, def) => {
   const i = process.argv.indexOf(`--${name}`);
   return i > -1 ? +process.argv[i + 1] : def;
 };
+const argStr = (name, def) => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i > -1 ? process.argv[i + 1] : def;
+};
 const PORT = arg('port', 8321);
-const PLAYERS = [Math.min(4, Math.max(1, arg('t0', 2))), Math.min(4, Math.max(1, arg('t1', 2)))];
+const TIER = setTier(argStr('tier', CONFIG.tier)); // low|mid|high|ultra scales the whole scene
+// tier sets the default army sizes; --t0/--t1 still override
+const PLAYERS = [Math.min(8, Math.max(1, arg('t0', CONFIG.players[0]))), Math.min(8, Math.max(1, arg('t1', CONFIG.players[1])))];
+const FORT = arg('fort', 0) > 0; // --fort 1 spawns per-team destructible castles
+const DOM = arg('dom', 0) > 0;  // --dom 1 = domination (3 capture zones, ticket bleed)
 
 const clients = new Map(); // ws -> {team, slot} | {spectator:true}
 let sim, state; // state: 'lobby' | 'playing'
+const arena = await createArena({ maxBodies: CONFIG.maxBodies }); // one box3d world, reused per battle
 
 function resetSim(seed = (Math.random() * 1e9) | 0) {
-  sim = createSim({ seed, players: PLAYERS });
+  sim = createSim({ seed, players: PLAYERS, arena, fort: FORT, dom: DOM });
   state = 'lobby';
   for (const who of clients.values()) if (!who.spectator) sim.ai.delete(`${who.team}:${who.slot}`);
 }
 resetSim(arg('seed', 42) | 0);
 
 function claimSlot() {
-  for (let slot = 0; slot < 4; slot++) {
+  for (let slot = 0; slot < 8; slot++) {
     for (let team = 0; team < 2; team++) {
       if (slot >= PLAYERS[team]) continue;
       if (sim.ai.has(`${team}:${slot}`)) {
@@ -38,9 +49,10 @@ function claimSlot() {
 function initMsg(who) {
   return JSON.stringify({
     type: 'init', players: PLAYERS, you: who, state,
+    tier: CONFIG.tier, render: CONFIG.render, // so the client matches the server's quality tier
     units: sim.units.map((u) => ({
       id: u.id, team: u.team, slot: u.slot, type: u.typeKey,
-      ax: u.ax, az: u.az, facing: u.facing, files: u.files, n: u.type.n,
+      ax: u.ax, az: u.az, facing: u.facing, files: u.files, n: u.n0,
     })),
   });
 }
@@ -55,10 +67,18 @@ function broadcast(msg) { for (const ws of clients.keys()) ws.send(msg); }
 
 // snapshot: [u8 0x01][u32 tick][per soldier: i16 x*100, i16 z*100, u8 face, u8 flags]
 // [per unit: i16 ax*100, i16 az*100, u8 morale, u8 files, u8 flags]
+// [u16 nProps][per prop: i16 x,y,z *100, i16 qx,qy,qz,qw *32767, u8 hx,hy,hz *50, u8 kind]
+// props = fort bricks (KIND 2) + ragdoll corpses (KIND 5) read from the physics buffer.
+const PROP_BYTES = 18;
 let tick = 0;
 function snapshot() {
   const nS = sim.soldiers.length, nU = sim.units.length;
-  const buf = new ArrayBuffer(5 + nS * 6 + nU * 7);
+  const xf = sim.arena.transforms, ST = sim.arena.XF_STRIDE, count = sim.arena.count;
+  const props = [];
+  for (let h = 0; h < count; h++) { const k = xf[h * ST + 7]; if (k === 2 || k === 5 || k === 6 || k === 7 || k === 8) props.push(h); }
+  const nP = props.length;
+
+  const buf = new ArrayBuffer(5 + nS * 6 + nU * 7 + 2 + nP * PROP_BYTES);
   const v = new DataView(buf);
   v.setUint8(0, 1);
   v.setUint32(1, tick, true);
@@ -67,7 +87,7 @@ function snapshot() {
     v.setInt16(o, Math.round(s.x * 100), true);
     v.setInt16(o + 2, Math.round(s.z * 100), true);
     v.setUint8(o + 4, Math.round(((s.face % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2) / (Math.PI * 2) * 255));
-    v.setUint8(o + 5, s.state | (s.fightT > 0 ? 4 : 0) | (s.unit.broken ? 8 : 0) | (s.unit.stance ? 16 : 0));
+    v.setUint8(o + 5, s.state | (s.fightT > 0 ? 4 : 0) | (s.unit.broken ? 8 : 0) | (s.unit.stance ? 16 : 0) | (s.down > 0 ? 32 : 0));
     o += 6;
   }
   for (const u of sim.units) {
@@ -77,6 +97,22 @@ function snapshot() {
     v.setUint8(o + 5, u.files);
     v.setUint8(o + 6, (u.broken ? 1 : 0) | (u.stance ? 2 : 0) | (u.alive > 0 ? 4 : 0));
     o += 7;
+  }
+  v.setUint16(o, nP, true); o += 2;
+  for (const h of props) {
+    const b = h * ST;
+    v.setInt16(o, Math.round(xf[b] * 100), true);
+    v.setInt16(o + 2, Math.round(xf[b + 1] * 100), true);
+    v.setInt16(o + 4, Math.round(xf[b + 2] * 100), true);
+    v.setInt16(o + 6, Math.round(xf[b + 3] * 32767), true);
+    v.setInt16(o + 8, Math.round(xf[b + 4] * 32767), true);
+    v.setInt16(o + 10, Math.round(xf[b + 5] * 32767), true);
+    v.setInt16(o + 12, Math.round(xf[b + 6] * 32767), true);
+    v.setUint8(o + 14, Math.min(255, Math.round(xf[b + 8] * 50)));
+    v.setUint8(o + 15, Math.min(255, Math.round(xf[b + 9] * 50)));
+    v.setUint8(o + 16, Math.min(255, Math.round(xf[b + 10] * 50)));
+    v.setUint8(o + 17, xf[b + 7]);
+    o += PROP_BYTES;
   }
   return buf;
 }
@@ -88,7 +124,10 @@ Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname === '/' ? '/battle.html' : url.pathname;
     const file = Bun.file(import.meta.dir + path);
-    return (await file.exists()) ? new Response(file) : new Response('not found', { status: 404 });
+    // no-store so the browser never serves a stale battle.js / arena.wasm after a rebuild
+    return (await file.exists())
+      ? new Response(file, { headers: { 'Cache-Control': 'no-store' } })
+      : new Response('not found', { status: 404 });
   },
   websocket: {
     open(ws) {
@@ -142,8 +181,8 @@ setInterval(() => {
   tick++;
   const snap = snapshot();
   const ev = sim.drainEvents();
-  const evMsg = JSON.stringify({ type: 'ev', e: ev, stats: sim.stats, counts: sim.counts, winner: sim.winner });
+  const evMsg = JSON.stringify({ type: 'ev', e: ev, stats: sim.stats, counts: sim.counts, winner: sim.winner, zones: sim.zones, tickets: sim.tickets });
   for (const ws of clients.keys()) { ws.send(snap); ws.send(evMsg); }
 }, 1000 / 12);
 
-console.log(`rome-arena server on http://localhost:${PORT}  (${PLAYERS[0]}v${PLAYERS[1]}, lobby open — press FIGHT in a client to start)`);
+console.log(`rome-arena server on http://localhost:${PORT}  (tier=${TIER}, ${PLAYERS[0]}v${PLAYERS[1]}${FORT ? ', forts' : ''}, lobby open — press FIGHT in a client to start)`);
