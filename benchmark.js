@@ -22,12 +22,14 @@ const tier = argStr('tier', 'low');
 setTier(tier);
 const arena = await createArena({ maxBodies: CONFIG.maxBodies });
 const results = [];
+const outputPath = `replays/benchmark-${Date.now()}.json`;
+let serviceUnavailable = false;
 
 for (let battle = 0; battle < battles; battle++) {
   const seed = seed0 + battle;
   const blue = resolveProvider('hybrid');
   const sim = createSim({ seed, players: CONFIG.players, arena, fort: true });
-  let calls = 0, failures = 0, inferenceMs = 0, lastStrategy = '', inputTokens = 0, outputTokens = 0;
+  let calls = 0, failures = 0, consecutiveFailures = 0, inferenceMs = 0, lastStrategy = '', inputTokens = 0, outputTokens = 0;
   const wallStarted = performance.now();
   while (sim.winner === null && sim.time < maxSeconds) {
     const started = performance.now();
@@ -35,25 +37,35 @@ for (let battle = 0; battle < battles; battle++) {
       const decision = await commandTeam(sim, 1, blue);
       inferenceMs += performance.now() - started;
       calls++;
+      consecutiveFailures = 0;
       lastStrategy = decision.strategy || lastStrategy;
       inputTokens += decision.usage?.input_tokens || 0;
       outputTokens += decision.usage?.output_tokens || 0;
       console.log(`battle ${battle + 1} t=${sim.time.toFixed(0)}s Blue: ${decision.summary} (${decision.latencyMs}ms tactical)`);
     } catch (e) {
       failures++;
+      consecutiveFailures++;
       console.error(`battle ${battle + 1} t=${sim.time.toFixed(0)}s inference failed: ${e.message}`);
+      if (consecutiveFailures >= 5) {
+        serviceUnavailable = true;
+        console.error('benchmark invalidated: 5 consecutive inference failures; stopping instead of counting an algorithm-only fallback match');
+        break;
+      }
     }
     const steps = Math.round(decisionSeconds * 30);
     for (let i = 0; i < steps && sim.winner === null; i++) sim.step(1 / 30);
   }
   const result = {
-    battle: battle + 1, seed, winner: sim.winner === 0 ? 'Red Algorithmic' : sim.winner === 1 ? 'Blue Pioneer Hybrid' : 'Draw',
+    battle: battle + 1, seed, valid: !serviceUnavailable,
+    winner: serviceUnavailable ? 'Invalid — inference unavailable' : sim.winner === 0 ? 'Red Algorithmic' : sim.winner === 1 ? 'Blue Pioneer Hybrid' : 'Draw',
     simulatedSeconds: +sim.time.toFixed(2), wallSeconds: +((performance.now() - wallStarted) / 1000).toFixed(2),
     survivors: sim.counts, calls, failures, inferenceMs: Math.round(inferenceMs),
     analyticTokens: { input: inputTokens, output: outputTokens }, lastStrategy,
   };
   results.push(result);
   console.log(JSON.stringify(result));
+  await Bun.write(outputPath, JSON.stringify({ tier, results }, null, 2));
+  if (serviceUnavailable) break;
 }
 
 const summary = {
@@ -61,10 +73,11 @@ const summary = {
   tier,
   results,
   wins: {
-    red: results.filter((r) => r.winner.startsWith('Red')).length,
-    blue: results.filter((r) => r.winner.startsWith('Blue')).length,
-    draw: results.filter((r) => r.winner === 'Draw').length,
+    red: results.filter((r) => r.valid && r.winner.startsWith('Red')).length,
+    blue: results.filter((r) => r.valid && r.winner.startsWith('Blue')).length,
+    draw: results.filter((r) => r.valid && r.winner === 'Draw').length,
+    invalid: results.filter((r) => !r.valid).length,
   },
 };
-await Bun.write(`replays/benchmark-${Date.now()}.json`, JSON.stringify(summary, null, 2));
+await Bun.write(outputPath, JSON.stringify(summary, null, 2));
 console.log(JSON.stringify(summary, null, 2));

@@ -127,6 +127,36 @@ published controller therefore adds confidence gates and an explicit
 `follow_algorithm` option. These negative results are part of the experiment, not
 discarded evidence; the guarded controller still needs a multi-seed run.
 
+A guarded five-seed run was attempted on 2026-09-20. The two completed, usable
+matches were split: Blue won seed 42 by 36–8 survivors; Red won seed 43 by 32–25.
+Seed 44 became invalid when Pioneer returned sustained `503 Cannot reach SGLang`
+after earlier 504s, and the batch was stopped rather than counting Blue's local
+fallback as hybrid inference. Therefore the current honest aggregate is **1–1 and
+inconclusive**. The benchmark now invalidates and stops after five consecutive
+inference failures so service outages cannot silently bias future results.
+
+After the service recovered, the guarded controller completed ten usable seeds:
+
+| Seed | Winner | Survivors (Red / Blue) | Final inference failures |
+|---:|---|---:|---:|
+| 42 | Blue Hybrid | 8 / 36 | 2 |
+| 43 | Red Algorithmic | 32 / 25 | 5 |
+| 44 | Red Algorithmic | 61 / 16 | 2 |
+| 45 | Blue Hybrid | 51 / 37 | 5 |
+| 46 | Blue Hybrid | 18 / 49 | 3 |
+| 47 | Blue Hybrid | 18 / 57 | 5 |
+| 48 | Blue Hybrid | 11 / 35 | 6 |
+| 49 | Red Algorithmic | 45 / 18 | 3 |
+| 50 | Blue Hybrid | 42 / 49 | 3 |
+| 51 | Red Algorithmic | 41 / 39 | 4 |
+
+Both consecutive five-seed blocks finished Blue 3–2, for a combined **Blue 6–4**.
+Total survivors were Blue 361 and Red 327. Analytic reported 6,312,805 input and
+5,242 output tokens. There were 38 final inference failures across 431 scheduled
+attempts (~8.8%). This is a repeatable directional edge in this small sample, not
+statistical proof: outcomes remain mixed, the survivor advantage is modest, the
+confidence interval is broad, and API reliability is a meaningful confounder.
+
 ## Live API contract verified during integration
 
 - Analytic: `POST https://alpha.pioneers.dev/api/v1/analytic`
