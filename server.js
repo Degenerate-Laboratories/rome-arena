@@ -27,14 +27,16 @@ const DOM = arg('dom', 0) > 0;  // --dom 1 = domination (3 capture zones, ticket
 const AI_TURN = arg('aiturn', 10); // seconds between LLM-general orders (mind Groq TPM limits)
 const AUTOSTART = arg('autostart', 0) > 0; // begin the battle with no human FIGHT press
 const SEATS = Math.max(1, arg('seats', 2)); // slots a single client commands (default 2)
+const SPECTATE = arg('spectate', 0) > 0; // force browser clients to observe without claiming AI slots
 
 // LLM generals per team: --ai0 groq --ai1 mock  (providers: groq|openai|pioneer|mock|none)
 const commanders = [null, null];
 for (let t = 0; t < 2; t++) {
   try { commanders[t] = resolveProvider(argStr(`ai${t}`, 'none')); }
   catch (e) { console.error(`team ${t} AI disabled: ${e.message}`); }
-  if (commanders[t]) console.log(`team ${t} commanded by LLM: ${commanders[t].name} (${commanders[t].model})`);
+  if (commanders[t]) console.log(`team ${t} commanded by AI: ${commanders[t].name} (${commanders[t].model})`);
 }
+const aiLabels = commanders.map((c, t) => argStr(`label${t}`, c ? c.model : null));
 
 const clients = new Map(); // ws -> {team, slot} | {spectator:true}
 let sim, state; // state: 'lobby' | 'playing'
@@ -44,8 +46,10 @@ function resetSim(seed = (Math.random() * 1e9) | 0) {
   sim = createSim({ seed, players: PLAYERS, arena, fort: FORT, dom: DOM, ctf: CTF });
   state = 'lobby';
   for (const who of clients.values()) if (!who.spectator) for (const s of who.slots) sim.ai.delete(`${who.team}:${s}`);
-  // an LLM-commanded team is driven only by its general, not the built-in unit AI
-  for (let t = 0; t < 2; t++) if (commanders[t]) for (let s = 0; s < PLAYERS[t]; s++) sim.ai.delete(`${t}:${s}`);
+  // Standalone model teams replace the built-in AI. Hybrid/JEV augments it with
+  // short tactical override leases, so the algorithm remains active as fallback.
+  for (let t = 0; t < 2; t++) if (commanders[t] && !commanders[t].hybrid)
+    for (let s = 0; s < PLAYERS[t]; s++) sim.ai.delete(`${t}:${s}`);
 }
 resetSim(arg('seed', 42) | 0);
 
@@ -57,7 +61,7 @@ const pendingDec = []; // general decisions since the last recorded frame
 function startRec() {
   rec = {
     players: PLAYERS, tier: CONFIG.tier, render: CONFIG.render,
-    ai: commanders.map((c) => (c ? c.model : null)),
+    ai: aiLabels,
     units: sim.units.map((u) => ({ id: u.id, team: u.team, slot: u.slot, type: u.typeKey, ax: u.ax, az: u.az, facing: u.facing, files: u.files, n: u.n0 })),
     frames: [],
   };
@@ -67,6 +71,7 @@ function startRec() {
 async function saveRec() {
   if (!rec || recSaved || !rec.frames.length) return;
   recSaved = true;
+  rec.winner = sim.winner;
   const name = `replay-${Date.now()}.json`;
   await Bun.write(import.meta.dir + '/replays/' + name, JSON.stringify(rec));
   console.log(`replay saved: replays/${name}  (${rec.frames.length} frames)`);
@@ -78,6 +83,7 @@ if (autoStart) { state = 'playing'; startRec(); }
 
 // A client commands up to SEATS slots (default 2), all on one team.
 function claimSlot() {
+  if (SPECTATE) return { spectator: true };
   for (let team = 0; team < 2; team++) {
     const free = [];
     for (let slot = 0; slot < PLAYERS[team]; slot++) if (sim.ai.has(`${team}:${slot}`)) free.push(slot);
@@ -93,7 +99,7 @@ function claimSlot() {
 function initMsg(who) {
   return JSON.stringify({
     type: 'init', players: PLAYERS, you: who, state,
-    ai: commanders.map((c) => (c ? c.model : null)), // LLM model per team (null = human/built-in AI)
+    ai: aiLabels, // display labels may also identify the built-in algorithmic opponent
     tier: CONFIG.tier, render: CONFIG.render,        // so the client matches the server's quality tier
     ctf: CTF,
     units: sim.units.map((u) => ({
@@ -252,22 +258,27 @@ setInterval(() => {
 // the general's decision is broadcast to the client.
 const aiBusy = [false, false];
 if (commanders[0] || commanders[1]) {
-  setInterval(() => {
-    if (state !== 'playing' || sim.winner !== null) return;
-    for (let t = 0; t < 2; t++) {
-      if (!commanders[t] || aiBusy[t]) continue;
+  const runCommander = (t) => {
+    if (state === 'playing' && sim.winner === null && commanders[t] && !aiBusy[t]) {
       aiBusy[t] = true;
       commandTeam(sim, t, commanders[t])
-        .then(({ taunt, count }) => {
-          const dec = { team: t, model: commanders[t].model, taunt: taunt || '…', count };
+        .then(({ taunt, summary, count, confidence, aggression, strikeProbability, latencyMs, usage, model }) => {
+          const detail = summary || taunt || '…';
+          const dec = { team: t, model: model || commanders[t].model, taunt: detail, count,
+            confidence, aggression, strikeProbability, latencyMs, usage };
           pendingDec.push(dec); // recorded into the next frame for replay
           broadcast(JSON.stringify({ type: 'general', ...dec }));
-          console.log(`AI ${t === 0 ? 'Red' : 'Blue'} general (${commanders[t].model}): ${taunt || '…'} [${count} orders]`);
+          const telemetry = latencyMs == null ? '' : ` ${latencyMs}ms conf=${confidence?.toFixed(2) ?? 'n/a'} aggression=${aggression?.toFixed(2)}`;
+          console.log(`AI ${t === 0 ? 'Red' : 'Blue'} general (${dec.model}): ${detail} [${count} orders]${telemetry}`);
         })
         .catch((e) => console.error(`AI team ${t} turn failed: ${e.message}`))
         .finally(() => { aiBusy[t] = false; });
     }
-  }, 1000 * AI_TURN);
+    setTimeout(() => runCommander(t), 1000 * AI_TURN);
+  };
+  // Offset Blue by half a turn so two remote inference requests do not hit the
+  // upstream tunnel at the same instant.
+  for (let t = 0; t < 2; t++) if (commanders[t]) setTimeout(() => runCommander(t), t * 500 * AI_TURN);
 }
 
 console.log(`rome-arena server on http://localhost:${PORT}  (tier=${TIER}, ${PLAYERS[0]}v${PLAYERS[1]}${FORT ? ', forts' : ''}, lobby open — press FIGHT in a client to start)`);

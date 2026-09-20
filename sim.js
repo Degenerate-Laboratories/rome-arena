@@ -667,7 +667,9 @@ export function createSim({ seed = 1, players = [2, 2], arena, fort = false, dom
       // Only AI-driven slots auto-assault along the siege flow field. A slot commanded
       // by a human or an LLM general (removed from sim.ai) OBEYS its orders — it forms
       // up at the ordered point and fights locally instead of being dragged to the wall.
-      const commanded = !sim.ai.has(`${u.team}:${u.slot}`);
+      // Augmented AI keeps the local algorithm as a fallback but may temporarily
+      // override a formation with a model-selected maneuver.
+      const commanded = !sim.ai.has(`${u.team}:${u.slot}`) || (u.aiOverrideUntil || 0) > sim.time;
       const navUnit = nav && teamStance[u.team] === 'attack' && T !== TYPES.catapult && u.role !== 'guard' && !commanded;
       const enemy = nearestEnemy(s, SEEK_RANGE);
       const eDist = enemy ? Math.hypot(enemy.x - s.x, enemy.z - s.z) : Infinity;
@@ -915,7 +917,7 @@ export function createSim({ seed = 1, players = [2, 2], arena, fort = false, dom
       }
       for (const u of units) {
         if (u.alive <= 0 || u.broken || u.garrison) continue; // garrisons never leave their wall
-        if (!sim.ai.has(`${u.team}:${u.slot}`)) continue;
+        if (!sim.ai.has(`${u.team}:${u.slot}`) || (u.aiOverrideUntil || 0) > sim.time) continue;
         if (u.typeKey === 'catapult') { // creep into range if nothing to shoot
           let best = null, bd = Infinity;
           for (const e of units) {
@@ -962,7 +964,11 @@ export function createSim({ seed = 1, players = [2, 2], arena, fort = false, dom
         let best = null, bd = Infinity;
         for (const e of units) {
           if (e.team === u.team || e.alive <= 0) continue;
-          const pref = u.typeKey === 'cavalry' && e.typeKey === 'archer' ? 0.5 : 1;
+          let pref = 1;
+          if (u.typeKey === 'cavalry' && e.typeKey === 'archer') pref = 0.5;
+          else if (u.typeKey === 'archer' && e.typeKey === 'catapult') pref = 0.55;
+          else if (u.typeKey === 'archer' && e.typeKey === 'archer') pref = 0.75;
+          else if ((u.typeKey === 'pike' || u.typeKey === 'spear') && e.typeKey === 'cavalry') pref = 0.6;
           const d = ((e.cx - u.cx) ** 2 + (e.cz - u.cz) ** 2) * pref;
           if (d < bd) { bd = d; best = e; }
         }

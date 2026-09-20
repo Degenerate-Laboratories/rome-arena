@@ -34,12 +34,30 @@ AITURN ?= 10
 ai: ## LLM generals battle: AI0/AI1 = provider[:model]; FORT/DOM/CTF=1 for objectives; auto-starts
 	bun server.js --port $(PORT) --tier $(TIER) --fort $(FORT) --dom $(DOM) --ctf $(CTF) --ai0 $(AI0) --ai1 $(AI1) --aiturn $(AITURN) --autostart 1
 
+analytic: TIER = low
+analytic: AITURN = 4
+analytic: ## Pioneer Analytic demo: fast typed tactical decisions for both armies
+	bun server.js --port $(PORT) --tier $(TIER) --fort $(FORT) --dom $(DOM) --ctf $(CTF) --ai0 analytic --ai1 analytic --aiturn $(AITURN) --autostart 1
+
+prove: TIER = low
+prove: AITURN = 4
+prove: ## usefulness demo: Red algorithmic AI vs Blue Pioneer hybrid AI
+	bun server.js --port $(PORT) --tier $(TIER) --seed $(SEED) --fort $(FORT) --dom $(DOM) --ctf $(CTF) --ai1 hybrid --aiturn $(AITURN) --autostart 1 --spectate 1 --label0 "Algorithmic AI" --label1 "Pioneer LLM + Analytic/JEV"
+
+benchmark: TIER = low
+benchmark: ## accelerated headless proof; BATTLES=, SEED=, and TIER= configure the run
+	bun benchmark.js --battles $(or $(BATTLES),1) --seed $(SEED) --tier $(TIER)
+
+scale: ## sweep unit tiers headlessly until the 30 Hz simulation budget is exhausted
+	bun scale_benchmark.js --seconds $(or $(SECONDS),8)
+
 P ?= groq
 models: ## list the chat models your key can use (P=groq|openai|pioneer)
 	@bun ai/models.js $(P)
 
-test: ## headless sim smoke test — asserts combat mechanics fire
+test: ## headless sim + Analytic commander tests
 	bun test_sim.js
+	bun test_analytic.js
 
 wasm: ## (maintainer) build the box3d physics module -> physics/arena.{mjs,wasm}; needs emscripten
 	bash physics/build.sh
@@ -56,4 +74,4 @@ wasm-fort: ## build a castle and bombard it; assert masonry is stable then caves
 help:
 	@grep -E '^[a-z]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/ —/'
 
-.PHONY: start run models stress ctf dom ai test wasm wasm-test wasm-bench wasm-fort help
+.PHONY: start run models stress ctf dom ai analytic prove benchmark scale test wasm wasm-test wasm-bench wasm-fort help

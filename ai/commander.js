@@ -3,6 +3,8 @@
 // (sim.order / toggleStance). Units then execute those orders until the next turn
 // — so this is turn-based command at a low polling frequency, not per-frame control.
 import { chat } from './providers.js';
+import { commandAnalyticTeam } from './analytic_commander.js';
+import { commandHybridTeam } from './hybrid_commander.js';
 
 const FIELD_X = 100, FIELD_Z = 70; // half-extents (FIELD_W/2, FIELD_D/2)
 const teamName = (t) => (t === 0 ? 'RED' : 'BLUE');
@@ -88,6 +90,8 @@ function apply(sim, team, orders) {
 
 // Run one turn for `team`. Returns { taunt, count } (count = orders applied).
 export async function commandTeam(sim, team, cfg) {
+  if (cfg.hybrid) return commandHybridTeam(sim, team, cfg);
+  if (cfg.analytic) return commandAnalyticTeam(sim, team, cfg);
   let plan;
   if (cfg.mock) {
     plan = mockPlan(sim, team);

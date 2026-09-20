@@ -240,7 +240,9 @@ function connect() {
         aiModels = m.ai || [null, null];
         renderGenerals();
       } else if (m.type === 'general') {
-        aiSay[m.team] = `${m.taunt} [${m.count} orders]`;
+        const tokens = m.usage?.input_tokens == null ? '' : ` · ${m.usage.input_tokens}+${m.usage.output_tokens || 0} tok`;
+        const telemetry = m.latencyMs == null ? '' : ` · ${m.latencyMs}ms · conf ${m.confidence == null ? '—' : Math.round(m.confidence * 100) + '%'} · aggression ${Number(m.aggression).toFixed(1)}/4 · strike ${Math.round((m.strikeProbability || 0) * 100)}%${tokens}`;
+        aiSay[m.team] = `${m.taunt} [${m.count} orders]${telemetry}`;
         renderGenerals();
       } else if (m.type === 'lobby') {
         phase = m.state;

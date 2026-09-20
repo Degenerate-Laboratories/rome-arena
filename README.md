@@ -25,6 +25,10 @@ make start FORT=1 DOM=1        # + domination scoring
 make dom FORT=1               # shortcut: domination siege
 make ctf                       # capture-the-flag (small squads)
 make ai FORT=1                 # two LLM generals fight a siege (needs an API key)
+make analytic FORT=1           # Pioneer Analytic typed-decision demo (needs PIONEER_API_KEY)
+make prove                     # Red algorithmic AI vs Blue Pioneer hybrid AI
+make benchmark BATTLES=3       # same experiment, accelerated and headless
+make scale                     # find the largest tier that sustains the 30 Hz sim budget
 make stress                    # ultra tier + forts, everything cranked
 ```
 
@@ -48,6 +52,20 @@ Flags combine freely. Set them on any `make` target (they're plain Make variable
 ### `make ai` — LLM generals
 
 Two language models command the armies (one per side), issuing orders each turn.
+
+For the Pioneer Analytic showcase, put `PIONEER_API_KEY=...` in `.env` and run
+`make analytic` (defaults to low tier and a two-second cadence). Each call
+batches a typed maneuver choice for every formation, an aggression score, and a yes/no strike decision. The spectator
+panel shows the chosen maneuvers, request latency, and mean model confidence live.
+
+`make prove` is the shareable usefulness test: both sides retain Rome Arena's local,
+deterministic combat heuristics. Blue augments them with periodic Pioneer normal-
+inference strategy and fast Analytic/JEV tactical overrides. The fixed seed makes reruns
+comparable, all browser clients are spectators, and the completed battle is saved
+under `replays/` with the winner and decisions. `make benchmark BATTLES=3` runs
+the same matchup without a browser and advances simulation time as fast as the CPU
+allows between model calls. Pass `TIER=high` to benchmark larger armies. `make scale`
+runs an algorithm-only CPU sweep through every tier before spending model credits.
 
 ```bash
 make ai                             # default: Llama-3.3-70B (Red) vs GPT-OSS-120B (Blue) on Groq
